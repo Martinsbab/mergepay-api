@@ -14,7 +14,10 @@ import {
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
 import { ipKey } from "../services/rate-limit-keys";
-import { safeFailureMessage } from "../services/job-retry";
+import {
+  applySep24Callback,
+  sep24CallbackSchema,
+} from "../services/sep24";
 import {
   paginationQuerySchema,
   buildPage,
@@ -25,7 +28,10 @@ import {
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
-import { sep24InteractiveRequestSchema } from "../validations/sep24";
+import {
+  sep24DepositRequestSchema,
+  sep24WithdrawRequestSchema,
+} from "../validations/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -93,9 +99,15 @@ export default async function anchorRoutes(app: FastifyInstance) {
   );
 
   // -- start deposit / withdraw -----------------------------------------------
-  async function start(kind: "deposit" | "withdrawal", req: any) {
+  async function start(
+    kind: "deposit" | "withdrawal",
+    req: any,
+    requestSchema = kind === "deposit"
+      ? sep24DepositRequestSchema
+      : sep24WithdrawRequestSchema
+  ) {
     const auth = requireUser(req);
-    const body = sep24InteractiveRequestSchema.parse(req.body);
+    const body = requestSchema.parse(req.body);
 
     // Validate that the requested asset is supported.
     validateAsset(body.assetCode);
@@ -142,7 +154,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive deposit",
         description:
           "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
-        body: openApiBody(sep24InteractiveRequestSchema),
+        body: openApiBody(sep24DepositRequestSchema),
         response: {
           200: {
             type: "object",
@@ -168,7 +180,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive withdrawal",
         description:
           "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
-        body: openApiBody(sep24InteractiveRequestSchema),
+        body: openApiBody(sep24WithdrawRequestSchema),
         response: {
           200: {
             type: "object",
@@ -202,7 +214,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
       const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
@@ -301,7 +313,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string() }).parse(req.params);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
@@ -332,12 +344,16 @@ export default async function anchorRoutes(app: FastifyInstance) {
         tags: ["SEP-24"],
         summary: "Anchor status webhook",
         description: "Receives signed webhook status notifications from SEP-24 anchors.",
+        body: openApiBody(sep24CallbackSchema),
         response: {
           200: {
             type: "object",
             additionalProperties: true,
             properties: {
-              ok: { type: "boolean" },
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
             },
           },
         },
@@ -349,60 +365,32 @@ export default async function anchorRoutes(app: FastifyInstance) {
       if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
-      const body = z
-        .object({
-          transaction: z
-            .object({ id: z.string(), status: z.string(), message: z.string().optional() })
-            .optional(),
-          id: z.string().optional(),
-          status: z.string().optional(),
-          message: z.string().optional(),
-        })
-        .passthrough()
-        .parse(req.body ?? {});
 
-      const externalId = body.transaction?.id ?? body.id;
-      const status = body.transaction?.status ?? body.status;
-      if (externalId && status) {
-        const mappedStatus = mapAnchorStatus(status);
-        const rawMessage = body.transaction?.message ?? body.message;
-        const sanitizedMessage = typeof rawMessage === "string" ? safeFailureMessage(rawMessage) : null;
+      const callback = sep24CallbackSchema.parse(req.body ?? {});
+      const result = await applySep24Callback(callback);
 
-        const sessions = await prisma.anchorSession.findMany({
-          where: { externalTransactionId: externalId },
+      const withdrawal = await prisma.withdrawal.findUnique({
+        where: { anchorTxId: callback.externalTransactionId },
+      });
+      if (withdrawal) {
+        await applyWithdrawalTransition({
+          withdrawalId: withdrawal.id,
+          nextStatus: mapAnchorStatusToWithdrawalStatus(
+            mapAnchorStatus(callback.rawStatus)
+          ),
+          source: "webhook",
         });
-        for (const session of sessions) {
-          // applyAnchorSessionTransition atomically validates the transition
-          // against the finite state map and writes its audit record in the
-          // same database transaction as the status change — see
-          // src/services/anchor-status.ts. An out-of-order or duplicate
-          // webhook delivery is a no-op rather than a regression.
-          await applyAnchorSessionTransition({
-            sessionId: session.id,
-            nextStatus: mappedStatus,
-            source: "webhook",
-            extraData: mappedStatus === "error" ? {
-              failureReason: sanitizedMessage,
-            } : undefined,
-          });
-        }
-
-        // The simpler `Withdrawal` record (POST /withdraw) is a separate
-        // table keyed by the same anchor transaction id — see
-        // src/services/withdrawal-status.ts for why it has its own status
-        // vocabulary and transition map.
-        const withdrawal = await (prisma as any).withdrawal.findUnique({
-          where: { anchorTxId: externalId },
-        });
-        if (withdrawal) {
-          await applyWithdrawalTransition({
-            withdrawalId: withdrawal.id,
-            nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
-            source: "webhook",
-          });
-        }
       }
-      return reply.code(200).send({ ok: true });
+
+      // 200 regardless of whether a session matched or the transition applied:
+      // anchors retry non-2xx responses, and re-delivering a callback that was
+      // correctly processed as a no-op only amplifies load.
+      return reply.code(200).send({
+        received: true,
+        status: result.status,
+        matched: result.matched,
+        updated: result.updated,
+      });
     }
   );
 }

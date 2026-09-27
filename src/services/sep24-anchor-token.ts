@@ -44,6 +44,8 @@ import { Errors } from "../errors";
 import { anchorService, mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
 import { audit } from "./audit";
+import { isRecognisedSep24Status } from "./sep24-types";
+import { sep24StellarTransactionHashSchema } from "../validations/sep24";
 
 const log = pino({ name: "sep24" });
 
@@ -65,21 +67,6 @@ const TERMINAL_FAILURE_STATUSES = new Set([
   "too_large",
 ]);
 
-/** Statuses this handler knows how to act on. Anything else is logged. */
-const RECOGNISED_STATUSES = new Set([
-  "incomplete",
-  "pending_user_transfer_start",
-  "pending_user_transfer_complete",
-  "pending_external",
-  "pending_anchor",
-  "pending_stellar",
-  "pending_trust",
-  "pending_user",
-  "completed",
-  "refunded",
-  ...TERMINAL_FAILURE_STATUSES,
-]);
-
 /**
  * The SEP-24 transaction object, in both shapes anchors send it: wrapped in a
  * `transaction` envelope (the shape most anchors reuse from their
@@ -96,7 +83,7 @@ const transactionFields = z.object({
   amount_in: z.string().max(64).nullish(),
   amount_out: z.string().max(64).nullish(),
   amount_fee: z.string().max(64).nullish(),
-  stellar_transaction_id: z.string().max(128).nullish(),
+  stellar_transaction_id: sep24StellarTransactionHashSchema.nullish(),
   external_transaction_id: z.string().max(255).nullish(),
   message: z.string().max(1024).nullish(),
 });
@@ -143,7 +130,9 @@ export function toSessionStatus(rawStatus: string): string {
 
 /** Whether this handler recognises the status the anchor reported. */
 export function isRecognisedStatus(rawStatus: string): boolean {
-  return RECOGNISED_STATUSES.has(rawStatus);
+  // Delegates to the canonical status tables in ./sep24-types so this handler
+  // cannot drift from the mapper or the session state machine again.
+  return isRecognisedSep24Status(rawStatus);
 }
 
 /**

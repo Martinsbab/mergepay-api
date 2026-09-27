@@ -154,7 +154,7 @@ describe("POST /api/webhooks", () => {
     const res = await register({ groupId: GROUP_ID });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().code).toBe("WEBHOOK_LIMIT_REACHED");
+    expect(res.json().error.code).toBe("WEBHOOK_LIMIT_REACHED");
     expect(prisma.webhook.create).not.toHaveBeenCalled();
   });
 });

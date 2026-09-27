@@ -223,8 +223,8 @@ describe("authenticated route — 401 contract", () => {
     const res = await app.inject({ method: "GET", url: "/me" });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
-    expect(res.json().error).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
+       expect(res.json().error.code).toBe("UNAUTHORIZED");
   });
 
   it("returns UNAUTHORIZED when the Authorization header is not Bearer", async () => {
@@ -235,7 +235,7 @@ describe("authenticated route — 401 contract", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("UNAUTHORIZED");
   });
 
   it("returns TOKEN_EXPIRED with a re-authentication hint for an expired token", async () => {
@@ -249,13 +249,13 @@ describe("authenticated route — 401 contract", () => {
     expect(res.statusCode).toBe(401);
     const body = res.json();
     expect(body.code).toBe("TOKEN_EXPIRED");
-    expect(body.error).toBe("TOKEN_EXPIRED");
+      expect(body.error.code).toBe("TOKEN_EXPIRED");
     expect(body.message).toBe("Token expired");
     expect(body.requestId).toBeTruthy();
     // The hint names both recovery paths: a full SEP-10 re-authentication and
     // the refresh endpoint for clients already holding a refresh token.
-    expect(body.details.hint).toMatch(/SEP-10/);
-    expect(body.details.hint).toMatch(/\/auth\/refresh/);
+      expect(body.error.details.hint).toMatch(/SEP-10/);
+      expect(body.error.details.hint).toMatch(/\/auth\/refresh/);
   });
 
   it("returns TOKEN_EXPIRED for a token inside the expiry margin", async () => {
@@ -267,7 +267,7 @@ describe("authenticated route — 401 contract", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("TOKEN_EXPIRED");
+    expect(res.json().error.code).toBe("TOKEN_EXPIRED");
   });
 
   // The issue's sketch writes `{ error: 'Token expired', code: 'TOKEN_EXPIRED' }`;
@@ -293,12 +293,12 @@ describe("authenticated route — 401 contract", () => {
 
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.error).toBe("INVALID_TOKEN");
+      expect(body.error.code).toBe("INVALID_TOKEN");
     expect(body.code).toBe("INVALID_TOKEN");
     expect(body.message).toBe("Invalid token");
     expect(body.requestId).toBeTruthy();
     // An unverifiable credential is not recoverable by refreshing.
-    expect(body.details?.hint).toBeUndefined();
+      expect(body.error.details?.hint).toBeUndefined();
   });
 
   it("returns INVALID_TOKEN for a malformed bearer token", async () => {
@@ -309,7 +309,7 @@ describe("authenticated route — 401 contract", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("INVALID_TOKEN");
+    expect(res.json().error.code).toBe("INVALID_TOKEN");
   });
 
   it("keeps the error envelope stack-free", async () => {

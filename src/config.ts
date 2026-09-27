@@ -168,6 +168,19 @@ const schema = z.object({
   WORKER_ANCHOR_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(120_000),
   WORKER_ANCHOR_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
 
+  // Retry budget for the worker *cycle tasks* themselves (issue #708): how
+  // many times a sweep that throws — a transient database or Horizon error —
+  // is retried in-cycle with exponential backoff before it is dead-lettered
+  // for that cycle and logged as critical. The per-job budgets above govern
+  // individual settlement/anchor rows; this one governs the batch sweeps.
+  WORKER_CYCLE_TASK_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  WORKER_CYCLE_TASK_RETRY_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(500),
+  WORKER_CYCLE_TASK_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(10_000),
+  // Consecutive failed cycles before the worker health heartbeat reports
+  // `healthy: false` and emits a critical log line. A count rather than a
+  // boolean because one failure is normal; a run of them is an outage.
+  WORKER_HEALTH_UNHEALTHY_THRESHOLD: z.coerce.number().int().positive().default(3),
+
   // Per-call network timeouts (ms) — every outbound Horizon/anchor request
   // goes through src/services/timeout.ts's fetchWithTimeout/withTimeout, so
   // a slow or hung upstream can't block a worker cycle indefinitely.
@@ -207,6 +220,15 @@ const schema = z.object({
   // identical schedules across instances reconverge into synchronized bursts
   // against an upstream that is already struggling.
   UPSTREAM_RETRY_JITTER_RATIO: z.coerce.number().min(0).max(1).default(0.25),
+  // Whether Horizon *reads* (account load, transaction lookup) also retry an
+  // HTTP 429 within the budget above, backing off exponentially and never
+  // sooner than a Retry-After the upstream sends. Submissions are unaffected.
+  // An explicit "true"/"false" string, because z.coerce.boolean() would turn
+  // the string "false" into true.
+  HORIZON_RETRY_ON_RATE_LIMIT: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
   NODE_ENV: z.string().default("development"),
   RECONCILIATION_INTERVAL: z.coerce.number().int().positive().default(30000),
   CONFIRMATION_THRESHOLD: z.coerce.number().int().positive().default(1),

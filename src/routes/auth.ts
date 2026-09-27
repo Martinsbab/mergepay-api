@@ -1,9 +1,8 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
-import { buildChallenge, verifyChallenge } from "../services/sep10";
+import { authenticateChallenge, buildChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
@@ -15,7 +14,11 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
-import { sep10VerifyRequestSchema } from "../validations/sep10";
+import {
+  sep10ChallengeRequestSchema,
+  sep10QuerySchema,
+  sep10VerifyRequestSchema,
+} from "../validations/sep10";
 import { openApiBody, openApiEnvelope } from "../lib/openapi";
 
 function shortName(pk: string): string {
@@ -34,6 +37,15 @@ export default async function authRoutes(app: FastifyInstance) {
   const challengeLimit = rateLimited("authChallenge");
   const verifyLimit = rateLimited("authVerify");
 
+  // Every body on this plugin is annotated with `enforce: false`: ajv is left
+  // describing the payload for the OpenAPI spec but not policing it, so a
+  // rejected body always comes back as one VALIDATION_ERROR carrying the
+  // message and `issues` the handler's Zod parse defined, rather than Fastify
+  // pre-empting it with ajv's wording on a subset of rules. The type keywords
+  // are kept — they are what makes the spec describe field types — and ajv's
+  // coercion is off factory-wide (see src/app.ts), so the value Zod judges is
+  // the value the client actually sent.
+
   app.post(
     "/auth/challenge",
     {
@@ -43,7 +55,7 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Request SEP-10 challenge",
         description:
           "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
-        body: openApiBody(z.object({ account: stellarAccountIdSchema })),
+        body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -57,7 +69,8 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
+      sep10QuerySchema.parse(req.query);
+      const body = sep10ChallengeRequestSchema.parse(req.body);
       return buildChallenge(body.account);
     }
   );
@@ -71,7 +84,7 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Verify SEP-10 challenge transaction",
         description:
           "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens.",
-        body: openApiBody(sep10VerifyRequestSchema),
+        body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -87,8 +100,11 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
+      sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
-      const publicKey = await verifyChallenge(body.transaction);
+      const { account: publicKey, challengeHash } = await authenticateChallenge(
+        body.transaction
+      );
 
       const user = await prisma.user.upsert({
         where: { stellarPublicKey: publicKey },
@@ -99,9 +115,12 @@ export default async function authRoutes(app: FastifyInstance) {
         },
       });
 
-      // The claims contract is unchanged by SEP-10 hardening: verification
-      // still yields a public key, and the session is still minted here.
-      const token = signToken({ id: user.id, stellarPublicKey: publicKey });
+      // Session claims are unchanged; SEP-10 adds only `jti`, the hash of the
+      // challenge this login redeemed.
+      const token = signToken(
+        { id: user.id, stellarPublicKey: publicKey },
+        { jwtid: challengeHash }
+      );
       // A fresh family per login, so revoking one compromised session does
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);
@@ -140,7 +159,9 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Exchange refresh token for access token",
         description:
           "Exchanges a valid refresh token for a new access token and rotated refresh token.",
-        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) })),
+        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) }), {
+          enforce: false,
+        }),
         response: {
           200: {
             type: "object",
@@ -286,7 +307,8 @@ export default async function authRoutes(app: FastifyInstance) {
           z.object({
             displayName: z.string().min(1).max(40).optional(),
             avatarUrl: z.string().url().nullable().optional(),
-          })
+          }),
+          { enforce: false }
         ),
         response: openApiEnvelope("user"),
       },
