@@ -95,9 +95,41 @@ describe("sep24InteractiveRequestSchema", () => {
       account: goodKey,
       to: goodKey,
       memo: "TAG",
+      memoType: "text",
       anchorName: "Test Anchor",
     });
     expect(result.success).toBe(true);
+  });
+
+  it("requires memo and memoType to be supplied together (issue #366)", () => {
+    // memo without memoType — an anchor cannot classify it.
+    expect(
+      sep24InteractiveRequestSchema.safeParse({ assetCode: "XLM", memo: "TAG" })
+        .success
+    ).toBe(false);
+    // memoType without memo — nothing to apply it to.
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "XLM",
+        memoType: "text",
+      }).success
+    ).toBe(false);
+    // Both together, with a supported memo type, is valid.
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "XLM",
+        memo: "TAG",
+        memoType: "text",
+      }).success
+    ).toBe(true);
+    // An unsupported memo type is rejected even with a memo.
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "XLM",
+        memo: "TAG",
+        memoType: "binary",
+      }).success
+    ).toBe(false);
   });
 
   it("rejects a malformed Stellar account / destination", () => {
@@ -112,6 +144,14 @@ describe("sep24InteractiveRequestSchema", () => {
     const result = sep24InteractiveRequestSchema.safeParse({
       assetCode: "XLM",
       amount: "0",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects unknown request fields", () => {
+    const result = sep24InteractiveRequestSchema.safeParse({
+      assetCode: "XLM",
+      unexpected: true,
     });
     expect(result.success).toBe(false);
   });
@@ -143,6 +183,15 @@ describe("sep24WithdrawRequestSchema", () => {
     });
     expect(ok.success).toBe(true);
   });
+
+  it("rejects unknown withdrawal fields", () => {
+    const result = sep24WithdrawRequestSchema.safeParse({
+      assetCode: "USDC",
+      amount: "5",
+      unexpected: true,
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 describe("POST /anchors/deposit — SEP-24 schema wiring", () => {
@@ -170,7 +219,7 @@ describe("POST /anchors/deposit — SEP-24 schema wiring", () => {
       payload: { assetCode: "XLM", account: badKey },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
     expect(anchorService.getToml).not.toHaveBeenCalled();
   });
 
@@ -183,7 +232,7 @@ describe("POST /anchors/deposit — SEP-24 schema wiring", () => {
       payload: { assetCode: "XLM", amount: "1.00000008" },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("VALIDATION_ERROR");
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
     expect(anchorService.getToml).not.toHaveBeenCalled();
   });
 
@@ -219,5 +268,102 @@ describe("POST /anchors/deposit — SEP-24 schema wiring", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(anchorService.getChallenge).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/sep24/deposit & POST /api/sep24/withdraw — SEP-24 route validation", () => {
+  const prisma = h.prisma;
+  let app: Awaited<ReturnType<typeof buildApp>>;
+
+  const authHeader = () => ({
+    authorization: `Bearer ${signToken({
+      id: "user_1",
+      stellarPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    })}`,
+  });
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    if (!app) app = await buildApp();
+  });
+
+  it("rejects invalid refundMemo or refundMemoType pairing", () => {
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemo: "REFUND1",
+      }).success
+    ).toBe(false);
+
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemoType: "text",
+      }).success
+    ).toBe(false);
+
+    expect(
+      sep24InteractiveRequestSchema.safeParse({
+        assetCode: "USDC",
+        refundMemo: "REFUND1",
+        refundMemoType: "text",
+      }).success
+    ).toBe(true);
+  });
+
+  it("POST /api/sep24/deposit — returns 400 for malformed assetCode", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/deposit",
+      headers: authHeader(),
+      payload: { assetCode: "INVALID_CODE_TOO_LONG" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /api/sep24/withdraw — returns 400 when amount is missing for withdrawal", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/withdraw",
+      headers: authHeader(),
+      payload: { assetCode: "USDC" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /api/sep24/deposit — accepts valid payload and initiates session", async () => {
+    const { anchorService } = await import("../src/services/anchor");
+    vi.mocked(anchorService.getToml).mockResolvedValue({
+      homeDomain: "testanchor.stellar.org",
+      webAuthEndpoint: "https://testanchor.stellar.org/auth",
+      transferServerSep24: "https://testanchor.stellar.org/sep24",
+      signingKey: goodKey,
+      assets: [],
+    } as any);
+    vi.mocked(anchorService.getChallenge).mockResolvedValue({} as any);
+    prisma.anchorSession.create.mockResolvedValue({
+      id: "session_sep24_1",
+      userId: "user_1",
+      anchorName: "Test",
+      kind: "deposit",
+      assetCode: "USDC",
+      interactiveUrl: null,
+      externalTransactionId: null,
+      status: "incomplete",
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    prisma.auditLog.create.mockResolvedValue({});
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/sep24/deposit",
+      headers: authHeader(),
+      payload: { assetCode: "USDC", amount: "10.00" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().session).toBeDefined();
   });
 });

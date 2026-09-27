@@ -115,6 +115,7 @@ model ExpenseShare {
   @@index([expenseId])
   @@index([userId])
   @@index([expenseId, userId])
+  @@index([status, expenseId])
   @@map("expense_shares")
 }
 

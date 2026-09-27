@@ -75,6 +75,29 @@ export const ErrorCode = {
    * promptly. See src/lib/time-bounds.ts.
    */
   INTENT_EXPIRED: "INTENT_EXPIRED",
+  /**
+   * 401 — the signed SEP-10 challenge arrived after its validity window
+   * closed. Deliberately distinct from UNAUTHORIZED (signature or domain
+   * failure — the envelope itself is wrong) and TOKEN_EXPIRED (a session
+   * credential, not a challenge): the remedy is to request a fresh challenge
+   * and sign it promptly. See src/services/sep10.ts.
+   */
+  CHALLENGE_EXPIRED: "CHALLENGE_EXPIRED",
+  /**
+   * 401 — the signed SEP-10 challenge declares a window that has not opened
+   * yet (its `minTime` is beyond the clock-skew tolerance). Distinct from
+   * CHALLENGE_EXPIRED (window closed) and UNAUTHORIZED (structural or
+   * signature failure): the envelope's bounds are present and usable but do
+   * not describe a presently redeemable challenge. See src/services/sep10.ts.
+   */
+  CHALLENGE_NOT_YET_VALID: "CHALLENGE_NOT_YET_VALID",
+  /**
+   * 401 — the signed SEP-10 challenge declares a window longer than the
+   * validity this server grants, so it is not an envelope this server issued
+   * however well it otherwise verifies. Distinct from CHALLENGE_EXPIRED and
+   * UNAUTHORIZED for the same reason. See src/services/sep10.ts.
+   */
+  CHALLENGE_WINDOW_TOO_LONG: "CHALLENGE_WINDOW_TOO_LONG",
   INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
@@ -104,6 +127,14 @@ export const ErrorCode = {
   ALREADY_SETTLED: "ALREADY_SETTLED",
   EXPENSE_SETTLED: "EXPENSE_SETTLED",
   LAST_ADMIN: "LAST_ADMIN",
+  /**
+   * 409 — a unique constraint rejected the write, so a record with these values
+   * already exists. Distinct from the state codes above, which name a workflow
+   * the caller can inspect, and from a bare CONFLICT: here the request is
+   * well-formed and the remedy is a different value, not a different action.
+   * See src/lib/prisma-error.ts.
+   */
+  DUPLICATE_RECORD: "DUPLICATE_RECORD",
   // 429
   RATE_LIMITED: "RATE_LIMITED",
   // 500
@@ -117,43 +148,29 @@ export const ErrorCode = {
    * a transient dependency failure. See src/lib/provider-error.ts.
    */
   PROVIDER_REJECTED: "PROVIDER_REJECTED",
+  // 503 — a dependency this process needs is unavailable, so the request could
+  // not be attempted at all. Used for the database being unreachable, refused,
+  // or timed out — the same condition /health already reports as not-ready, and
+  // distinct from UPSTREAM_ERROR, which is a third-party HTTP dependency. See
+  // src/lib/prisma-error.ts.
+  SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
-/**
- * Application error with a stable machine-readable code, HTTP status,
- * optional structured details, and an optional correlation request ID.
- *
- * The `requestId` is injected by the central error handler — callers do not
- * need to set it.
- */
-export class AppError extends Error {
-  /** HTTP status code (e.g. 404). */
-  readonly status: number;
-  /** Mirror of `status` — Fastify reads `statusCode` on error objects. */
-  readonly statusCode: number;
-  /** Machine-readable error code string (e.g. "NOT_FOUND"). */
-  readonly code: string;
-  /** Structured detail payload (e.g. Zod validation issues). */
-  readonly details?: unknown;
-  /** Correlation ID injected by the error handler, not set by callers. */
-  requestId?: string;
+export {
+  AppError,
+  NotFoundError,
+  ValidationError,
+  UnauthorizedError,
+  ForbiddenError,
+  ConflictError,
+  BadRequestError,
+  InternalServerError,
+} from "../errors/app-error";
 
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    details?: unknown,
-  ) {
-    super(message);
-    this.name = "AppError";
-    this.status = status;
-    this.statusCode = status;
-    this.code = code;
-    this.details = details;
-  }
-}
+import { AppError } from "../errors/app-error";
+
 
 /** Factory helpers — mirrors the original `Errors` object in src/errors.ts. */
 export const Errors = {
@@ -176,6 +193,28 @@ export const Errors = {
    * token this API actually minted. */
   invalidToken: (msg = "Invalid token") =>
     new AppError(401, ErrorCode.INVALID_TOKEN, msg),
+
+  /**
+   * The SEP-10 challenge the wallet signed has passed its validity window.
+   * Deliberately distinct from the generic UNAUTHORIZED rejection of
+   * signature and domain failures (see src/services/sep10.ts): the envelope
+   * was otherwise well-formed and correctly signed, so the only remedy is to
+   * request a fresh challenge and sign it promptly. Carries
+   * `details.challengeValiditySeconds` so clients can size their own
+   * sign-prompt timeout without hard-coding one.
+   */
+  challengeExpired: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_EXPIRED, msg, details),
+
+  /** The challenge's `minTime` has not been reached — bounds are usable but
+   * the window has not opened. See CHALLENGE_NOT_YET_VALID. */
+  challengeNotYetValid: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_NOT_YET_VALID, msg, details),
+
+  /** The challenge's window outlives the validity this server issues. See
+   * CHALLENGE_WINDOW_TOO_LONG. */
+  challengeWindowTooLong: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_WINDOW_TOO_LONG, msg, details),
 
   forbidden: (msg = "You do not have access to this resource") =>
     new AppError(403, ErrorCode.FORBIDDEN, msg),
