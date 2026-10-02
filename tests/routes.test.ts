@@ -538,11 +538,16 @@ describe("group routes", () => {
     it("DELETE /groups/:id/members/:memberId removes member and creates audit log", async () => {
       const admin = fakeUser({ id: "user_admin" });
       const targetUser = fakeUser({ id: "user_target" });
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
+      // The caller's admin membership is read twice — once by the
+      // requireGroupRole preHandler and again by the in-transaction admin
+      // re-check (#700) — then the target's row is read by the handler.
+      const callerAdmin = {
         groupId: "group_1",
         userId: admin.id,
         role: "admin",
-      });
+      };
+      prisma.groupMember.findUnique.mockResolvedValueOnce(callerAdmin);
+      prisma.groupMember.findUnique.mockResolvedValueOnce(callerAdmin);
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         id: "member_target",
         groupId: "group_1",

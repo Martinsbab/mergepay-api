@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center"> 
 
 # Mergepay — API
 
@@ -195,6 +195,28 @@ See [.env.example](.env.example). Key ones:
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
 
+#### Database connection & query timeouts
+
+Prisma is initialized in [src/db.ts](src/db.ts) with explicit connection
+resilience settings so a slow, saturated, or partitioned PostgreSQL **fails
+fast instead of hanging request workers indefinitely**. The values below are
+appended to `DATABASE_URL` as query parameters (`buildDatasourceUrl`) and
+forwarded to the underlying driver; a per-query middleware adds a wall-clock
+budget on top.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | 10 | Max time to establish a socket to Postgres |
+| `DATABASE_POOL_TIMEOUT_SECONDS` | 10 | Max wait for a free pooled connection before erroring |
+| `DATABASE_CONNECTION_LIMIT` | 5 | Max pooled connections per instance |
+| `DATABASE_QUERY_TIMEOUT_MS` | 10000 | Per-query wall-clock budget enforced by middleware |
+
+Parameters already present in `DATABASE_URL` are overridden by these values,
+so the effective timeout policy is always the one configured here. When a
+query exceeds `DATABASE_QUERY_TIMEOUT_MS` it rejects with `Query timeout after
+Nms`, the request fails promptly, and the health check
+(`checkDatabaseConnection`, used by `/health/ready`) applies the same budget.
+
 #### CORS configuration
 
 Cross-origin access for the frontend (`mergepay-web`) is configured entirely
@@ -265,44 +287,54 @@ Configuration for SEP-24 anchor callbacks (`POST /api/webhooks/sep24`):
 
 Every route is covered by a global default limit
 (`RATE_LIMIT_GLOBAL_MAX` / `RATE_LIMIT_GLOBAL_WINDOW_MS`, default 100 per
-minute), plus route-appropriate overrides for endpoints with different
-traffic patterns or trust boundaries:
+minute). `/health` and `/docs` are exempt from it so probes and the API
+reference stay reachable during an incident. Endpoints with a different
+traffic pattern or trust boundary replace that default with their own bucket:
 
 | Route(s) | Variables | Default |
 | --- | --- | --- |
 | `POST /auth/challenge` | `RATE_LIMIT_AUTH_CHALLENGE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /auth/verify` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /auth/verify`, `POST /auth/refresh` | `RATE_LIMIT_AUTH_VERIFY_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /groups/:id/expenses` | `RATE_LIMIT_EXPENSE_CREATE_MAX` / `_WINDOW_MS` | 30 / 1 min |
 | `POST /expenses/:id/settle`, `POST /groups/:id/settlements`, `POST /groups/:id/treasury/deposit`, `POST /groups/:id/treasury/withdraw` | `RATE_LIMIT_SETTLEMENT_CREATE_MAX` / `_WINDOW_MS` | 20 / 1 min |
-| `POST /settlements/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 30 / 1 min |
-| `POST /treasury-transactions/:id/confirm` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
-| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
-| `GET /anchors`, `GET /anchors/sessions` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
-| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 60 / 1 min |
-| `POST /groups` | `RATE_LIMIT_GROUP` | 30 / 1 min |
-| `GET /history` | `RATE_LIMIT_HISTORY` | 60 / 1 min |
+| `POST /settlements/:id/confirm`, `POST /withdraw/:id/confirm` | `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /api/settlements/execute` | `RATE_LIMIT_SETTLEMENT_EXECUTE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /treasury-transactions/:id/confirm`, `POST /groups/:groupId/treasury/proposals/:proposalId/sign`, `POST /api/treasury/proposals/:id/signatures` | `RATE_LIMIT_TREASURY_SUBMIT_MAX` / `_WINDOW_MS` | 30 / 1 min |
+| `POST /groups/:groupId/treasury/proposals`, `POST /api/treasury/proposals` | `RATE_LIMIT_TREASURY_PROPOSE_MAX` / `_WINDOW_MS` | 20 / 1 min |
+| `POST /anchors/deposit`, `POST /anchors/withdraw`, `POST /anchors/sessions/:id/complete`, `POST /api/sep24/deposit`, `POST /api/sep24/withdraw`, `POST /withdraw` | `RATE_LIMIT_ANCHOR_INIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `GET /anchors`, `GET /anchors/sessions`, `GET /anchors/sessions/:id` | `RATE_LIMIT_ANCHOR_POLL_MAX` / `_WINDOW_MS` | 60 / 1 min |
+| `POST /anchors/webhook` | `RATE_LIMIT_ANCHOR_WEBHOOK_MAX` / `_WINDOW_MS` | 50 / 1 min |
+| `POST /api/sep24/callback`, `POST /api/webhooks/sep24` | `SEP24_RATE_LIMIT_MAX` / `_WINDOW_MS` | 10 / 1 min |
+| `POST /groups` | `RATE_LIMIT_GROUP` / `_WINDOW_MS` | 10 / 1 min |
+| `GET /history` | `RATE_LIMIT_HISTORY` / `_WINDOW_MS` | 30 / 1 min |
 
 **Tuning a deployment.** Every value above is an environment variable with a
 safe default, so a deployment overrides only what it needs — for example a
 wallet integration that legitimately retries submissions can raise
 `RATE_LIMIT_SETTLEMENT_CONFIRM_MAX` without loosening SEP-10 or anchor
-budgets. Windows are milliseconds and capped at one hour; maximums must be
-positive integers, so a typo cannot silently disable limiting. The single
-source of truth for which route gets which policy is the table in
-[src/config/ratelimit.ts](src/config/ratelimit.ts); routes name a policy rather
-than repeating numbers, and each policy has its own key prefix, which is what
-makes the buckets independent.
+budgets. Windows are milliseconds and are rejected at startup above one hour;
+maximums must be positive integers. Both bounds exist so a typo cannot silently
+disable limiting. The single source of truth for which route gets which policy
+is the table in [src/lib/rate-limit.ts](src/lib/rate-limit.ts); routes name a
+policy rather than repeating numbers, and each policy has its own key prefix,
+which is what makes the buckets independent. The registration of the limiter
+itself — global limits, key strategy, counter store, and the 429 body — is in
+[src/plugins/rate-limit.ts](src/plugins/rate-limit.ts).
 
 Every route above has a bucket separate from ordinary authenticated reads, so
 exhausting a submission or anchor budget never blocks a client from reading its
 own groups, expenses, or settlement status.
 
-Limit keys are the authenticated user's internal id when available
-(never a Stellar public key), or the resolved client IP otherwise —
-`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy`
-option is explicitly enabled, which this app does not do by default. If
-you deploy behind a reverse proxy or load balancer and want per-client
-(rather than per-proxy) limiting, enable `trustProxy` in `src/app.ts` and
-make sure only your proxy can reach the app directly.
+Limit keys are the authenticated user's SEP-10 public key when the request
+carries a session, and the resolved client IP otherwise. SEP-10 has no session
+yet, so `/auth/challenge`, `/auth/verify`, and `/auth/refresh` are keyed by IP
+alone: a public-key bucket there would make the 429 threshold depend on whether
+an account is known to the API, turning the limiter into an account oracle.
+`req.ip` does not trust `X-Forwarded-For` unless Fastify's `trustProxy` option
+is explicitly enabled, which this app does not do by default. If you deploy
+behind a reverse proxy or load balancer and want per-client (rather than
+per-proxy) limiting, enable `trustProxy` in `src/app.ts` and make sure only your
+proxy can reach the app directly.
 
 The anchor webhook's rate limit is abuse protection only — it never
 replaces the shared-secret (`ANCHOR_WEBHOOK_SECRET`) check, which remains
@@ -316,7 +348,8 @@ store (`rate_limit_buckets` table, see
 query errors (e.g. a transient database outage), the request is allowed
 through rather than the whole API returning 500s — a degraded rate limiter
 is preferable to a full outage. Every 429 response includes standard
-`Retry-After` / `X-RateLimit-*` headers.
+`Retry-After` / `X-RateLimit-*` headers and the standard error envelope
+(`{"error": ..., "code": "RATE_LIMITED", "message": ..., "requestId": ...}`).
 
 ### Request size limits
 
@@ -454,6 +487,33 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 **from the anchor**. The wallet signs it; `POST /anchors/sessions/:id/complete`
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
+
+`/api/sep24/deposit|withdraw` are aliases of the same two routes and share the
+same request contract. Both are validated by the Zod schemas in
+[src/validations/sep24.ts](src/validations/sep24.ts) before the anchor is
+contacted, so a malformed request never reaches an upstream call, the database,
+or the audit log:
+
+- The body is `.strict()`: `assetCode` (1–12 alphanumeric characters,
+  upper-cased), an optional `assetIssuer`, `account`/`to`/`refundAddress` as
+  checksum-valid Stellar public keys, an optional `amount` (required to
+  withdraw) that must be a positive decimal string with at most 7 places, and
+  `memo`/`refundMemo` bounded by their `memoType` (`text` ≤ 28 UTF-8 bytes with
+  no control characters, `id` an unsigned 64-bit integer, `hash` a
+  base64-encoded 32-byte value). `memo` and `memoType` must be supplied
+  together, unknown keys are rejected, and `extraMetadata` is capped at 20 keys
+  and 2 KB serialized.
+- The query string is validated too, and carries nothing but an optional `lang`.
+  A parameter the body does not define — `?asset_code=XLM`, the SEP-24 wire
+  spelling of the body's `assetCode` — is a 400 naming that parameter, not a
+  silently dropped hint that the body then contradicts.
+- The asset is checked against the configured registry *as a pair*: an issuer
+  Mergepay does not issue that asset under is rejected instead of being dropped
+  in favour of the configured one.
+- Every rejection is the shared `VALIDATION_ERROR` envelope with per-field
+  `details` and `issues`. The routes document the same schemas through
+  `openApiBody(..., { enforce: false })`, so Fastify's ajv cannot pre-empt the
+  handler and answer in its own words — the Zod schema is the only validator.
 
 Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
 

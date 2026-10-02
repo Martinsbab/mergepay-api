@@ -7,7 +7,7 @@ import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
-import { requireGroupRole } from "../plugins/group-access";
+import { requireGroupRole } from "../middleware";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";

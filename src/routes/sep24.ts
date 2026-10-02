@@ -21,7 +21,6 @@ import { auditTx } from "../services/audit";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { rateLimited } from "../lib/rate-limit";
-import { ipKey } from "../services/rate-limit-keys";
 import { openApiBody } from "../lib/openapi";
 import {
   applySep24Callback,
@@ -31,8 +30,13 @@ import {
 import {
   sep24CallbackQuerySchema,
   sep24DepositRequestSchema,
+  sep24InitQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
+import {
+  validateSep24Deposit,
+  validateSep24Withdraw,
+} from "../schemas/sep24";
 
 export default async function sep24Routes(app: FastifyInstance) {
   const initLimit = rateLimited("anchorInit");
@@ -45,9 +49,17 @@ export default async function sep24Routes(app: FastifyInstance) {
       : sep24WithdrawRequestSchema
   ) {
     const auth = requireUser(req);
+    // Query first, then body: both are Zod-owned, and both run before the
+    // anchor is contacted, so a malformed request never reaches an upstream
+    // call, the database, or the audit log.
+    sep24InitQuerySchema.parse(req.query ?? {});
     const body = requestSchema.parse(req.body);
 
-    validateAsset(body.assetCode);
+    // The issuer is part of the request contract, so it is validated *with*
+    // the code rather than dropped: a caller naming an issuer Mergepay does not
+    // issue that asset under would otherwise get a session created against a
+    // different asset than the one it asked for.
+    validateAsset(body.assetCode, body.assetIssuer);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
@@ -84,14 +96,18 @@ export default async function sep24Routes(app: FastifyInstance) {
   app.post(
     "/api/sep24/deposit",
     {
-      preHandler: [app.authenticate],
+      preHandler: [app.authenticate, validateSep24Deposit],
       ...initLimit,
       schema: {
         tags: ["SEP-24"],
         summary: "Initiate SEP-24 deposit flow with Zod validation",
         description:
           "Validates payload with Zod and initiates a SEP-24 deposit interactive session.",
-        body: openApiBody(sep24DepositRequestSchema),
+        // Documented from the same Zod schema the handler parses with, but with
+        // the rules stripped: the handler is the only validator, so a rejection
+        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24DepositRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -110,14 +126,15 @@ export default async function sep24Routes(app: FastifyInstance) {
   app.post(
     "/api/sep24/withdraw",
     {
-      preHandler: [app.authenticate],
+      preHandler: [app.authenticate, validateSep24Withdraw],
       ...initLimit,
       schema: {
         tags: ["SEP-24"],
         summary: "Initiate SEP-24 withdrawal flow with Zod validation",
         description:
           "Validates payload with Zod and initiates a SEP-24 withdrawal interactive session.",
-        body: openApiBody(sep24WithdrawRequestSchema),
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24WithdrawRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -139,13 +156,7 @@ export default async function sep24Routes(app: FastifyInstance) {
   app.post(
     "/api/sep24/callback",
     {
-      config: {
-        rateLimit: {
-          max: config.SEP24_RATE_LIMIT_MAX,
-          timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
-          keyGenerator: ipKey("sep24.callback"),
-        },
-      },
+      ...rateLimited("sep24Callback"),
       schema: {
         tags: ["SEP-24"],
         summary: "Process SEP-24 anchor callback",

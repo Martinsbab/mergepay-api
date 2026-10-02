@@ -436,8 +436,9 @@ const GROUP_ROUTES: GroupRoute[] = [
   { method: "GET", path: "/groups/:groupId/treasury/proposals", role: "member" },
   { method: "POST", path: "/groups/:groupId/treasury/proposals/:proposalId/sign", role: "member" },
   { method: "GET", path: "/groups/:groupId/treasury/status", role: "member" },
-  // src/routes/webhooks.ts
-  { method: "POST", path: "/groups/:groupId/webhooks", role: "member" },
+  // src/routes/webhooks.ts — registration is admin-only (#700): a group
+  // webhook streams the group's financial events to a caller-supplied URL.
+  { method: "POST", path: "/groups/:groupId/webhooks", role: "admin" },
   { method: "GET", path: "/groups/:groupId/webhooks", role: "member" },
   { method: "DELETE", path: "/groups/:groupId/webhooks/:webhookId", role: "admin" },
   { method: "POST", path: "/groups/:groupId/webhooks/:webhookId/test", role: "member" },

@@ -206,92 +206,9 @@ export async function listGroupExpenses<T extends { createdAt: Date; id: string 
   return { items, meta: { ...meta, total } };
 }
 
-// -- creation ---------------------------------------------------------------
+export {
+  expensePaymentIntent,
+  validateExpenseXdr,
+  type ExpenseIntentRecord,
+} from "./expense-xdr";
 
-/** One participant's computed, validated share, ready to be persisted. */
-export interface ExpenseShareDraft {
-  userId: string;
-  shareAmount: string;
-}
-
-/**
- * Everything the persistence step needs. The caller has already validated
- * membership, the payer, the split arithmetic, and the asset — this payload
- * describes rows to write, not a request to interpret.
- */
-export interface CreateGroupExpenseParams {
-  groupId: string;
-  /** Whose expense it is; their own share is persisted as settled. */
-  payerUserId: string;
-  /** The authenticated caller, recorded as the audit actor. */
-  actorUserId: string;
-  title: string;
-  description?: string | null;
-  amount: string;
-  assetCode: string;
-  assetIssuer?: string | null;
-  splitType: string;
-  memo: string;
-  receiptUrl?: string | null;
-  shares: ExpenseShareDraft[];
-}
-
-/**
- * Persist a group expense, its participant splits, and its `expense.create`
- * audit entry in ONE Prisma transaction.
- *
- * The three writes span three tables and must land together. Without a shared
- * transaction, a split that fails after the expense row is inserted leaves an
- * expense with no shares — invisible to settlement but visible in the history
- * — and a successful audit write can describe a row that was never committed.
- * Inside `prisma.$transaction`, any throw (a constraint violation on a split,
- * a failing audit write, an abrupt connection drop) rolls back every write in
- * the unit, so the database either holds all three records or none of them.
- *
- * Validation and authorization stay with the caller; this function only
- * persists what has already been proven valid.
- */
-export async function createGroupExpense<
-  T extends { createdAt: Date; id: string }
->(params: CreateGroupExpenseParams, include: Prisma.ExpenseInclude): Promise<T> {
-  const created = await prisma.$transaction(async (tx) => {
-    const expense = await tx.expense.create({
-      data: {
-        groupId: params.groupId,
-        payerUserId: params.payerUserId,
-        title: params.title,
-        description: params.description ?? null,
-        amount: params.amount,
-        assetCode: params.assetCode,
-        assetIssuer: params.assetIssuer ?? null,
-        splitType: params.splitType,
-        memo: params.memo,
-        receiptUrl: params.receiptUrl ?? null,
-        shares: {
-          create: params.shares.map((share) => ({
-            userId: share.userId,
-            shareAmount: share.shareAmount,
-            // The payer's own share is settled the moment the expense exists.
-            status: share.userId === params.payerUserId ? "settled" : "pending",
-          })),
-        },
-      },
-      include,
-    });
-
-    // Same transaction: the audit entry exists if and only if the expense it
-    // documents was committed. `auditTx` deliberately does not swallow errors.
-    await auditTx(tx, {
-      userId: params.actorUserId,
-      groupId: params.groupId,
-      action: "expense.create",
-      entityType: "expense",
-      entityId: expense.id,
-      metadata: { amount: params.amount, assetCode: params.assetCode },
-    });
-
-    return expense;
-  });
-
-  return created as unknown as T;
-}

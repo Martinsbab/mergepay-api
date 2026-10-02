@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import Fastify from "fastify";
 import rateLimit from "@fastify/rate-limit";
-import { config } from "../src/config";
+import { config, envSchema } from "../src/config";
 import { isGlobalRateLimitExempt } from "../src/lib/rate-limit";
 
 describe("rate limit configuration", () => {
@@ -18,9 +18,10 @@ describe("rate limit configuration", () => {
     );
   });
 
-  it("gives settlement creation and confirmation their own explicit limits distinct from the global default", () => {
+  it("gives settlement creation, confirmation, and execution their own explicit limits distinct from the global default", () => {
     expect(config.RATE_LIMIT_SETTLEMENT_CREATE_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
     expect(config.RATE_LIMIT_SETTLEMENT_CONFIRM_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
+    expect(config.RATE_LIMIT_SETTLEMENT_EXECUTE_MAX).toBeLessThan(config.RATE_LIMIT_GLOBAL_MAX);
   });
 
   it("gives the anchor webhook its own explicit limit", () => {
@@ -34,6 +35,68 @@ describe("rate limit configuration", () => {
 
   it("RATE_LIMIT_HEALTH config is defined", () => {
     expect(config.RATE_LIMIT_HEALTH).toBeGreaterThan(0);
+  });
+});
+
+describe("rate limit window bounds", () => {
+  // The schema caps every window at one hour. A window is the only thing
+  // between a mistyped value and an endpoint that is effectively unlimited:
+  // RATE_LIMIT_AUTH_VERIFY_WINDOW_MS=60000000 is a valid number and would hand
+  // an attacker sixteen days of unlimited login attempts. Rejecting it at boot
+  // turns a silent hole into a startup error.
+  const HOUR_MS = 60 * 60 * 1000;
+
+  it("accepts a window at the one-hour bound", () => {
+    const parsed = envSchema.parse({
+      ...process.env,
+      RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: String(HOUR_MS),
+      RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: String(HOUR_MS),
+    });
+    expect(parsed.RATE_LIMIT_AUTH_VERIFY_WINDOW_MS).toBe(HOUR_MS);
+    expect(parsed.RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS).toBe(HOUR_MS);
+  });
+
+  it("rejects a window beyond the one-hour bound", () => {
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_AUTH_VERIFY_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
+
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_SETTLEMENT_CREATE_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
+
+    expect(
+      envSchema.safeParse({
+        ...process.env,
+        RATE_LIMIT_SETTLEMENT_EXECUTE_WINDOW_MS: String(HOUR_MS + 1),
+      }).success
+    ).toBe(false);
+  });
+
+  it("rejects a non-positive or fractional window", () => {
+    for (const value of ["0", "-1", "60000.5"]) {
+      expect(
+        envSchema.safeParse({
+          ...process.env,
+          RATE_LIMIT_GLOBAL_WINDOW_MS: value,
+        }).success,
+        `window ${value} should be rejected`
+      ).toBe(false);
+    }
+  });
+
+  it("rejects a non-positive maximum", () => {
+    // `max: 0` would disable a route entirely rather than limit it, and a
+    // negative value is meaningless; both must fail at boot.
+    expect(
+      envSchema.safeParse({ ...process.env, RATE_LIMIT_AUTH_VERIFY_MAX: "0" }).success
+    ).toBe(false);
   });
 });
 
