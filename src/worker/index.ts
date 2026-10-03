@@ -1038,6 +1038,9 @@ async function reconcileSingleAnchor(
       return;
     }
 
+    // Transient failures are retried with exponential backoff
+    const delayMs = retryDelayMs(attempt, ANCHOR_RETRY_POLICY);
+    
     await prisma.anchorSession.update({
       where: { id: job.id },
       data: {
@@ -1047,20 +1050,52 @@ async function reconcileSingleAnchor(
         errorCategory,
         nextAttemptAt: exhausted
           ? null
-          : new Date(Date.now() + retryDelayMs(attempt, ANCHOR_RETRY_POLICY)),
+          : new Date(Date.now() + delayMs),
       },
     });
 
     if (exhausted) {
+      // Dead-letter handling: mark as permanently failed after exhausting retries
+      await applyAnchorSessionTransition({
+        sessionId: job.id,
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: job.status,
+        reason: `${reason} (retries exhausted after ${attempt} attempts)`,
+        extraData: {
+          lastPolledAt: now,
+          failureReason: `${reason} (retries exhausted after ${attempt} attempts)`,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        } as never,
+      });
       jobLog.error(
         {
           jobType: "anchor",
           jobId: job.id,
           attempt,
-          outcome: "failed",
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "dead_letter",
+          category: "permanent",
           reason,
         },
-        "anchor poll failed with terminal error"
+        "anchor poll retries exhausted - marked as dead letter"
+      );
+    } else {
+      jobLog.warn(
+        {
+          jobType: "anchor",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "retry_scheduled",
+          category: errorCategory,
+          nextDelayMs: delayMs,
+          nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+          reason,
+        },
+        "anchor poll failed - retry scheduled with exponential backoff"
       );
     }
     return;
@@ -1289,6 +1324,7 @@ interface WithdrawalJob {
   anchorTxId: string | null;
   anchorToken: string | null;
   status: string;
+  retryCount: number;
 }
 
 /**
@@ -1307,27 +1343,94 @@ async function reconcileSingleWithdrawal(
 
   if (!job.anchorToken || !job.anchorTxId) return;
 
+  const attempt = job.retryCount + 1;
   const result: PollResult = await anchorService.pollTransaction({
     transferServer,
     token: job.anchorToken,
     id: job.anchorTxId,
   });
 
+  const now = new Date();
+
   // A failed poll (timeout, unreachable anchor, HTTP error, malformed JSON)
-  // leaves the row exactly as it was. A single bad response must never move
-  // a money record: the withdrawal stays `processing`, the next cycle polls
-  // again, and the anchor's own webhook can still complete it meanwhile.
+  // is now handled with retry logic similar to anchor sessions.
   if (result.isError) {
-    jobLog.warn(
-      {
-        jobType: "withdrawal",
-        jobId: job.id,
-        outcome: "retry_scheduled",
-        category: result.category,
-        reason: safeFailureMessage(result.message),
+    const exhausted = attempt >= ANCHOR_RETRY_POLICY.maxAttempts;
+    const reason = safeFailureMessage(result.message);
+    const errorCategory: JobFailureCategory =
+      exhausted || result.errorCategory === "permanent" ? "permanent" : "transient";
+
+    // Permanent failures stop the withdrawal immediately
+    if (result.errorCategory === "permanent") {
+      jobLog.error(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          outcome: "failed",
+          category: "permanent",
+          reason,
+        },
+        "withdrawal poll failed with a permanent error"
+      );
+      return;
+    }
+
+    // Transient failures are retried with exponential backoff
+    const delayMs = retryDelayMs(attempt, ANCHOR_RETRY_POLICY);
+    
+    await prisma.withdrawal.update({
+      where: { id: job.id },
+      data: {
+        retryCount: attempt,
+        failureReason: reason,
+        errorCategory,
+        nextAttemptAt: exhausted
+          ? null
+          : new Date(Date.now() + delayMs),
       },
-      "withdrawal poll failed; status left unchanged"
-    );
+    });
+
+    if (exhausted) {
+      // Dead-letter handling: mark as permanently failed after exhausting retries
+      await prisma.withdrawal.update({
+        where: { id: job.id },
+        data: {
+          status: "failed",
+          failureReason: `${reason} (retries exhausted after ${attempt} attempts)`,
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        },
+      });
+      jobLog.error(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "dead_letter",
+          category: "permanent",
+          reason,
+        },
+        "withdrawal poll retries exhausted - marked as dead letter"
+      );
+    } else {
+      jobLog.warn(
+        {
+          jobType: "withdrawal",
+          jobId: job.id,
+          attempt,
+          maxAttempts: ANCHOR_RETRY_POLICY.maxAttempts,
+          outcome: "retry_scheduled",
+          category: errorCategory,
+          nextDelayMs: delayMs,
+          nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+          reason,
+        },
+        "withdrawal poll failed - retry scheduled with exponential backoff"
+      );
+    }
     return;
   }
 
@@ -1380,11 +1483,17 @@ async function reconcileSingleWithdrawal(
  * racing this loop can only duplicate anchor *reads*, never a transition.
  */
 export async function reconcileWithdrawals(): Promise<void> {
+  const now = new Date();
   const withdrawals = await prisma.withdrawal.findMany({
     where: {
       status: "processing",
       anchorTxId: { not: null },
       anchorToken: { not: null },
+      retryCount: { lt: ANCHOR_RETRY_POLICY.maxAttempts },
+      AND: [
+        { OR: [{ errorCategory: null }, { errorCategory: { not: "permanent" } }] },
+        { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+      ],
     },
     orderBy: { updatedAt: "asc" as const },
     take: config.WORKER_BATCH_SIZE,
@@ -1419,6 +1528,7 @@ export async function reconcileWithdrawals(): Promise<void> {
       anchorTxId: withdrawal.anchorTxId,
       anchorToken: withdrawal.anchorToken,
       status: withdrawal.status,
+      retryCount: withdrawal.retryCount ?? 0,
     };
     const ctx = jobContext("withdrawal", job.id);
 
